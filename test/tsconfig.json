@@ -1,0 +1,13 @@
+{
+  "compilerOptions": {
+    "target": "ES2020", "lib": ["ES2022", "DOM", "DOM.Iterable"], "module": "ESNext", "moduleResolution": "bundler",
+    "jsx": "react-jsx", "strict": true, "noEmit": true, "skipLibCheck": true, "isolatedModules": true, "types": [],
+    "baseUrl": "..", "ignoreDeprecations": "6.0",
+    "paths": {
+      "dexie": ["test/stubs/dexie.ts"], "@azure/msal-browser": ["test/stubs/msal.ts"],
+      "browser-image-compression": ["test/stubs/image-compression.ts"], "virtual:pwa-register": ["test/stubs/pwa-register.ts"],
+      "pdf-lib": ["test/node_modules/pdf-lib"]
+    }
+  },
+  "include": ["../src", "types"]
+}

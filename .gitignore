@@ -1,0 +1,7 @@
+node_modules/
+dist/
+test-dist/
+test-results/
+test/fixtures/
+test/node_modules
+.env.local
