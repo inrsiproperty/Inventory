@@ -7,8 +7,11 @@
 
 const CLIENT_ID_KEY = 'inventory.clientId';
 
+/** "Inventory App" registration in the owner's Default Directory (Entra). Client IDs are not secret. */
+const REGISTERED_CLIENT_ID = 'd2439f50-4c9e-4165-be02-46d81a73875a';
+
 export function getClientId(): string {
-  const baked = (import.meta.env.VITE_MSAL_CLIENT_ID as string | undefined) || '';
+  const baked = (import.meta.env.VITE_MSAL_CLIENT_ID as string | undefined) || REGISTERED_CLIENT_ID;
   if (baked.trim()) return baked.trim();
   try {
     return localStorage.getItem(CLIENT_ID_KEY) || '';
@@ -18,7 +21,7 @@ export function getClientId(): string {
 }
 
 export function clientIdIsBakedIn(): boolean {
-  return !!((import.meta.env.VITE_MSAL_CLIENT_ID as string | undefined) || '').trim();
+  return !!((import.meta.env.VITE_MSAL_CLIENT_ID as string | undefined) || REGISTERED_CLIENT_ID).trim();
 }
 
 export function setLocalClientId(id: string) {
