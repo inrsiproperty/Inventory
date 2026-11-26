@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { applyStructureOp } from './actions';
+import { applyStructureOp, lockIfComplete } from './actions';
 import { activeAccount, authConfigured, getToken } from './auth';
 import { ROOT_FOLDER } from './config';
 import { currentUser, db, forRemote, getSettings } from './db';
@@ -7,7 +7,7 @@ import { bus } from './events';
 import * as G from './graph';
 import { ENTRY_FILE_RE, SETTINGS_PATH, entryFileName, inventoryDir, propertyRootPath, tenancyDir } from './paths';
 import { makeThumb } from './photos';
-import type { AppSettings, Entry, Inventory, Item, Photo, PhotoPayload, Property, Room, StructureOp, SyncMeta, Tenancy } from './types';
+import type { AppSettings, Entry, Inventory, Item, Photo, PhotoPayload, Property, Room, SignaturePayload, StructureOp, SyncMeta, Tenancy } from './types';
 
 // Offline-first sync. Everything is already safe on the phone; this uploads it to
 // OneDrive, retrying with back-off, and pulls back anything new (delta query).
@@ -50,7 +50,7 @@ export function useSyncStatus(): SyncStatus {
 }
 
 export async function countPending() {
-  const [photos, props, tens, invs, entries, exps, settings] = await Promise.all([
+  const [photos, props, tens, invs, entries, exps, settings, files] = await Promise.all([
     db.photos.where('uploadStatus').equals('pending').count(),
     db.properties.where('dirty').equals(1).count(),
     db.tenancies.where('dirty').equals(1).count(),
@@ -58,8 +58,9 @@ export async function countPending() {
     db.entries.where('dirty').equals(1).count(),
     db.exports.where('uploadStatus').equals('pending').count(),
     db.settings.where('dirty').equals(1).count(),
+    db.files.where('uploadStatus').equals('pending').count(),
   ]);
-  return { pendingPhotos: photos, pendingChanges: props + tens + invs + entries + exps + settings };
+  return { pendingPhotos: photos, pendingChanges: props + tens + invs + entries + exps + settings + files };
 }
 
 async function refreshCounts() {
@@ -140,6 +141,8 @@ async function serInventory(inv: Inventory) {
 async function pushSettings() {
   const s = await db.settings.get('app');
   if (!s || !s.dirty || !due(s)) return;
+  const props = await db.properties.toArray();
+  if (props.length && props.every((p) => p.role === 'tenant')) return; // don't write into a tenant's own OneDrive
   const body = serSettings(s);
   try {
     await G.upload({ kind: 'me-root' }, SETTINGS_PATH, body);
@@ -152,7 +155,7 @@ async function pushSettings() {
 }
 
 async function pushProperties() {
-  const list = (await db.properties.where('dirty').equals(1).toArray()).filter(due);
+  const list = (await db.properties.where('dirty').equals(1).toArray()).filter((p) => due(p) && p.role !== 'tenant');
   for (const p of list) {
     const body = serProperty(p);
     try {
@@ -163,9 +166,10 @@ async function pushProperties() {
         const driveId = item.parentReference?.driveId;
         const folderId = item.parentReference?.id;
         if (!driveId || !folderId) throw new Error('OneDrive did not return the folder');
-        await db.properties.update(p.id, { driveId, folderId });
+        await db.properties.update(p.id, { driveId, folderId, landlordDriveUserId: item.createdBy?.user?.id });
       } else {
         item = await G.upload(target(p), 'property.json', body);
+        if (!p.landlordDriveUserId && item.createdBy?.user?.id) await db.properties.update(p.id, { landlordDriveUserId: item.createdBy.user.id });
       }
       await rememberRemote(item, p.id);
       const cur = await db.properties.get(p.id);
@@ -181,7 +185,7 @@ async function pushTenancies() {
   const list = (await db.tenancies.where('dirty').equals(1).toArray()).filter(due);
   for (const t of list) {
     const p = await db.properties.get(t.propertyId);
-    if (!p?.folderId) continue;
+    if (!p?.folderId || p.role === 'tenant') continue;
     const body = serTenancy(t);
     try {
       const item = await G.upload(target(p), `${tenancyDir(t)}/tenancy.json`, body);
@@ -199,7 +203,7 @@ async function pushInventories() {
   const list = (await db.inventories.where('dirty').equals(1).toArray()).filter(due);
   for (const inv of list) {
     const p = await db.properties.get(inv.propertyId);
-    if (!p?.folderId) continue;
+    if (!p?.folderId || p.role === 'tenant') continue;
     const rel = `${inventoryDir(inv)}/inventory.json`;
     const write = async (eTag?: string) => {
       const body = await serInventory(inv);
@@ -237,7 +241,7 @@ async function pushPhotos() {
   await pool(list, 3, async (ph) => {
     const p = await db.properties.get(ph.propertyId);
     const inv = await db.inventories.get(ph.inventoryId);
-    if (!p?.folderId || !inv) return;
+    if (!p?.folderId || !inv || p.accessRevoked) return;
     const full = await db.blobs.get(`${ph.id}:full`);
     if (!full) {
       await db.photos.update(ph.id, { uploadStatus: 'failed', sync: failed(ph.sync, new Error('Photo file missing on this phone')) });
@@ -275,15 +279,43 @@ async function pushPhotos() {
   });
 }
 
+async function pushFiles() {
+  const list = (await db.files.where('uploadStatus').equals('pending').toArray()).filter(due);
+  for (const f of list) {
+    const p = await db.properties.get(f.propertyId);
+    const inv = await db.inventories.get(f.inventoryId);
+    const blob = await db.blobs.get(`${f.id}:file`);
+    if (!p?.folderId || !inv || !blob || p.accessRevoked) continue;
+    const rel = `${inventoryDir(inv)}/${f.relPath}`;
+    try {
+      let item: G.DriveItem | null;
+      try {
+        item = await G.upload(target(p), rel, blob.blob, { contentType: f.contentType, conflict: 'fail' });
+      } catch (e) {
+        if (!(e instanceof G.GraphError && e.status === 409)) throw e;
+        item = await G.getItem(target(p), rel);
+      }
+      if (item) await rememberRemote(item, p.id);
+      await db.files.update(f.id, { uploadStatus: 'uploaded', sync: undefined });
+    } catch (e) {
+      if (isFatal(e)) throw e;
+      await db.files.update(f.id, { sync: failed(f.sync, e) });
+    }
+  }
+}
+
 async function pushEntries() {
   const list = (await db.entries.where('dirty').equals(1).toArray()).filter(due);
   // A photo's entry goes up after the photo itself.
-  const pendingPhotoEntries = new Set((await db.photos.where('uploadStatus').equals('pending').toArray()).map((p) => p.entryId));
+  const pendingPhotoEntries = new Set([
+    ...(await db.photos.where('uploadStatus').equals('pending').toArray()).map((p) => p.entryId),
+    ...(await db.files.where('uploadStatus').equals('pending').toArray()).map((f) => f.entryId),
+  ]);
   const ready = list.filter((e) => !pendingPhotoEntries.has(e.id)).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   await pool(ready, 4, async (e) => {
     const p = await db.properties.get(e.propertyId);
     const inv = await db.inventories.get(e.inventoryId);
-    if (!p?.folderId || !inv) return;
+    if (!p?.folderId || !inv || p.accessRevoked) return;
     const rel = `${inventoryDir(inv)}/entries/${entryFileName(e)}`;
     try {
       let item: G.DriveItem | null;
@@ -309,7 +341,7 @@ async function pushExports() {
     const p = await db.properties.get(x.propertyId);
     const inv = await db.inventories.get(x.inventoryId);
     const pdf = await db.blobs.get(`${x.id}:pdf`);
-    if (!p?.folderId || !inv || !pdf) continue;
+    if (!p?.folderId || !inv || !pdf || p.accessRevoked) continue;
     try {
       const item = await G.upload(target(p), `${inventoryDir(inv)}/${x.fileName}`, pdf.blob, {
         contentType: 'application/pdf',
@@ -368,10 +400,34 @@ async function discoverProperties() {
 
 const rank = (name: string) => (name === 'property.json' ? 0 : name === 'tenancy.json' ? 1 : name === 'inventory.json' ? 2 : 3);
 
-async function ingestEntry(e: Entry) {
+/** True unless OneDrive says the file was made by someone other than the landlord while claiming to be the landlord. */
+function claimsCheck(e: Entry, f: G.DriveItem | undefined, p: Property): boolean {
+  const claimsLandlord = e.authorRole === 'landlord' || (!!p.landlordId && e.authorId === p.landlordId);
+  const by = f?.createdBy?.user?.id;
+  if (!claimsLandlord || !by || !p.landlordDriveUserId) return true;
+  return by.toLowerCase() === p.landlordDriveUserId.toLowerCase();
+}
+
+async function ingestEntry(e: Entry, f?: G.DriveItem, p?: Property) {
   if (await db.entries.get(e.id)) return;
-  await db.entries.put({ ...e, dirty: 0, sync: undefined });
-  if (e.type === 'structure-change') await applyStructureOp(e.payload as StructureOp);
+  const verified = p ? claimsCheck(e, f, p) : true;
+  await db.entries.put({ ...e, authorVerified: verified ? undefined : false, dirty: 0, sync: undefined });
+  const isLandlord = verified && (p?.landlordId ? e.authorId === p.landlordId : e.authorRole === 'landlord');
+  if (e.type === 'structure-change' && isLandlord) await applyStructureOp(e.payload as StructureOp);
+  if (e.type === 'signature') {
+    const sp = e.payload as SignaturePayload;
+    if (sp.fileId && !(await db.files.get(sp.fileId)))
+      await db.files.put({
+        id: sp.fileId,
+        entryId: e.id,
+        inventoryId: e.inventoryId,
+        propertyId: e.propertyId,
+        relPath: sp.imageFile,
+        contentType: 'image/png',
+        uploadStatus: 'uploaded',
+        hasBlob: 0,
+      });
+  }
   if (e.type === 'photo') {
     const meta = (e.payload as PhotoPayload).photo;
     if (meta && !(await db.photos.get(meta.id))) {
@@ -391,17 +447,72 @@ async function ingestEntry(e: Entry) {
   }
 }
 
+/** Walks the whole property folder (used when delta isn't available, e.g. on a shared folder). */
+async function walkTree(driveId: string, folderId: string): Promise<G.DriveItem[]> {
+  const out: G.DriveItem[] = [];
+  const queue = [folderId];
+  while (queue.length) {
+    const id = queue.shift()!;
+    for (const c of await G.listChildrenById(driveId, id)) {
+      if (c.folder) queue.push(c.id);
+      else out.push(c);
+    }
+  }
+  return out;
+}
+
+function byLandlord(f: G.DriveItem, p: Property) {
+  const by = f.lastModifiedBy?.user?.id || f.createdBy?.user?.id;
+  return !by || !p.landlordDriveUserId || by.toLowerCase() === p.landlordDriveUserId.toLowerCase();
+}
+
 async function pullProperty(p: Property) {
   if (!p.driveId || !p.folderId) return;
-  let res: { items: G.DriveItem[]; deltaLink: string };
-  try {
-    res = await G.delta(p.driveId, p.folderId, p.deltaLink);
-  } catch (e) {
-    // An expired delta token: start over from scratch.
-    if (e instanceof G.GraphError && (e.status === 410 || e.code === 'resyncRequired')) res = await G.delta(p.driveId, p.folderId);
-    else throw e;
+  if (p.role === 'tenant') {
+    // Has the landlord removed our access? OneDrive answers 403/404 straight away.
+    try {
+      await G.getItemById(p.driveId, p.folderId);
+      if (p.accessRevoked) await db.properties.update(p.id, { accessRevoked: false });
+    } catch (e) {
+      if (e instanceof G.GraphError && (e.status === 403 || e.status === 404)) {
+        await db.properties.update(p.id, { accessRevoked: true });
+        return;
+      }
+      throw e;
+    }
   }
-  const files = res.items.filter((i) => i.file && !i.deleted && i.name.endsWith('.json')).sort((a, b) => rank(a.name) - rank(b.name));
+  let items: G.DriveItem[];
+  let deltaLink: string | undefined;
+  try {
+    const res = await G.delta(p.driveId, p.folderId, p.deltaLink);
+    items = res.items;
+    deltaLink = res.deltaLink;
+  } catch (e) {
+    if (e instanceof G.GraphError && (e.status === 410 || e.code === 'resyncRequired')) {
+      const res = await G.delta(p.driveId, p.folderId);
+      items = res.items;
+      deltaLink = res.deltaLink;
+    } else if (e instanceof G.GraphError && [400, 403, 405, 501].includes(e.status)) {
+      items = await walkTree(p.driveId, p.folderId); // delta not offered here
+    } else throw e;
+  }
+
+  // Files deleted in OneDrive (e.g. by someone using the OneDrive app directly): put entries back.
+  for (const d of items.filter((i) => i.deleted)) {
+    const known = await db.remoteFiles.get(d.id);
+    if (!known) continue;
+    await db.remoteFiles.delete(d.id);
+    if (ENTRY_FILE_RE.test(known.name)) {
+      const e = await db.entries.get(known.name.slice(-41, -5));
+      if (e) await db.entries.update(e.id, { dirty: 1, sync: undefined });
+    } else if (known.name.endsWith('.jpg')) {
+      const photoId = known.name.slice(-40, -4);
+      const ph = await db.photos.get(photoId);
+      if (ph && (await db.blobs.get(`${photoId}:full`))) await db.photos.update(photoId, { uploadStatus: 'pending' });
+    }
+  }
+
+  const files = items.filter((i) => i.file && !i.deleted && i.name.endsWith('.json')).sort((a, b) => rank(a.name) - rank(b.name));
   const todo: G.DriveItem[] = [];
   for (const f of files) {
     const known = await db.remoteFiles.get(f.id);
@@ -417,16 +528,33 @@ async function pullProperty(p: Property) {
   }
   const driveId = p.driveId;
   const handle = async (f: G.DriveItem) => {
+    const url = f['@microsoft.graph.downloadUrl'];
+    // property.json, tenancy.json and inventory.json are only ever written by the landlord.
+    if (rank(f.name) < 3 && !byLandlord(f, p)) {
+      await rememberRemote(f, p.id);
+      return;
+    }
     if (f.name === 'property.json') {
-      const r = await readJson<Property>(driveId, f.id, f['@microsoft.graph.downloadUrl']);
+      const r = await readJson<Property>(driveId, f.id, url);
       const cur = await db.properties.get(p.id);
-      if (cur && !cur.dirty) await db.properties.put({ ...cur, ...r, driveId: cur.driveId, folderId: cur.folderId, deltaLink: cur.deltaLink, dirty: 0 });
+      if (cur && !cur.dirty)
+        await db.properties.put({
+          ...cur,
+          ...r,
+          role: cur.role,
+          driveId: cur.driveId,
+          folderId: cur.folderId,
+          deltaLink: cur.deltaLink,
+          landlordDriveUserId: cur.landlordDriveUserId,
+          accessRevoked: cur.accessRevoked,
+          dirty: 0,
+        });
     } else if (f.name === 'tenancy.json') {
-      const r = await readJson<Tenancy>(driveId, f.id, f['@microsoft.graph.downloadUrl']);
+      const r = await readJson<Tenancy>(driveId, f.id, url);
       const cur = await db.tenancies.get(r.id);
       if (!cur || !cur.dirty) await db.tenancies.put({ ...r, dirty: 0 });
     } else if (f.name === 'inventory.json') {
-      const r = await readJson<Inventory & { rooms: Room[]; items: Item[] }>(driveId, f.id, f['@microsoft.graph.downloadUrl']);
+      const r = await readJson<Inventory & { rooms: Room[]; items: Item[] }>(driveId, f.id, url);
       const { rooms, items, ...inv } = r;
       const cur = await db.inventories.get(inv.id);
       if (!cur) {
@@ -436,7 +564,7 @@ async function pullProperty(p: Property) {
         await db.inventories.put({ ...cur, ...inv, dirty: 0, sync: { attempts: 0, nextTryAt: 0, eTag: f.eTag } });
       }
     } else if (ENTRY_FILE_RE.test(f.name)) {
-      await ingestEntry(await readJson<Entry>(driveId, f.id, f['@microsoft.graph.downloadUrl']));
+      await ingestEntry(await readJson<Entry>(driveId, f.id, url), f, (await db.properties.get(p.id)) || p);
     }
     await rememberRemote(f, p.id);
   };
@@ -447,7 +575,23 @@ async function pullProperty(p: Property) {
     4,
     handle,
   );
-  await db.properties.update(p.id, { deltaLink: res.deltaLink });
+  if (deltaLink) await db.properties.update(p.id, { deltaLink });
+}
+
+async function fetchMissingFiles() {
+  const missing = (await db.files.where('uploadStatus').equals('uploaded').toArray()).filter((f) => !f.hasBlob).slice(0, 10);
+  for (const f of missing) {
+    const p = await db.properties.get(f.propertyId);
+    const inv = await db.inventories.get(f.inventoryId);
+    if (!p?.folderId || !inv || p.accessRevoked) continue;
+    const blob = await G.downloadByPath(target(p), `${inventoryDir(inv)}/${f.relPath}`).catch((e) => {
+      if (isFatal(e)) throw e;
+      return null;
+    });
+    if (!blob) continue;
+    await db.blobs.put({ key: `${f.id}:file`, blob });
+    await db.files.update(f.id, { hasBlob: 1 });
+  }
 }
 
 async function fetchMissingThumbs() {
@@ -455,7 +599,7 @@ async function fetchMissingThumbs() {
   await pool(missing, 3, async (ph) => {
     const p = await db.properties.get(ph.propertyId);
     const inv = await db.inventories.get(ph.inventoryId);
-    if (!p?.folderId || !inv) return;
+    if (!p?.folderId || !inv || p.accessRevoked) return;
     const blob = await G.downloadByPath(target(p), `${inventoryDir(inv)}/${ph.fileName}`);
     if (!blob) return;
     await db.blobs.put({ key: `${ph.id}:thumb`, blob: await makeThumb(blob) });
@@ -468,6 +612,12 @@ async function pullAll() {
   const props = (await db.properties.toArray()).filter((p) => p.folderId);
   for (const p of props) await pullProperty(p);
   await fetchMissingThumbs();
+  await fetchMissingFiles();
+  // Landlord's phone: lock anything every party has now signed.
+  for (const inv of await db.inventories.toArray()) {
+    const p = await db.properties.get(inv.propertyId);
+    if (inv.status !== 'locked' && (p?.role || 'landlord') === 'landlord') await lockIfComplete(inv.id);
+  }
 }
 
 // ---------- engine ----------
@@ -516,11 +666,14 @@ async function cycle() {
     await pushTenancies();
     await pushInventories();
     await pushPhotos();
+    await pushFiles();
     await pushEntries();
     await pushExports();
     await pullAll();
-    // Anything created while we were pulling.
+    // Anything created while we were pulling (including a lock and its signed PDF).
+    await pushInventories();
     await pushEntries();
+    await pushExports();
     await refreshCounts();
     setStatus({ state: 'idle', lastSyncAt: new Date().toISOString(), detail: undefined });
   } catch (e) {

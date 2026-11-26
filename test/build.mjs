@@ -19,12 +19,13 @@ const stubs = {
   '@azure/msal-browser': 'test/stubs/msal.ts',
   'browser-image-compression': 'test/stubs/image-compression.ts',
   'virtual:pwa-register': 'test/stubs/pwa-register.ts',
+  signature_pad: 'test/stubs/signature-pad.ts',
 };
 
 const aliasPlugin = {
   name: 'alias',
   setup(b) {
-    b.onResolve({ filter: /^(dexie|@azure\/msal-browser|browser-image-compression|virtual:pwa-register)$/ }, (a) => ({ path: path.join(root, stubs[a.path]) }));
+    b.onResolve({ filter: /^(dexie|@azure\/msal-browser|browser-image-compression|virtual:pwa-register|signature_pad)$/ }, (a) => ({ path: path.join(root, stubs[a.path]) }));
     b.onResolve({ filter: /\.css$/ }, () => ({ path: 'ignored-css', namespace: 'css-stub' }));
     b.onLoad({ filter: /.*/, namespace: 'css-stub' }, () => ({ contents: '', loader: 'js' }));
   },

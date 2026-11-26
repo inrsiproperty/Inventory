@@ -1,11 +1,14 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import { ReportIssueFab, UIProvider } from './components/Overlays';
+import { migrateLandlordInfo } from './lib/actions';
 import { initAuth } from './lib/auth';
 import { currentUser, db, getKV, getSettings, setKV, useLive } from './lib/db';
 import { getMe } from './lib/graph';
 import { useRoute } from './lib/router';
 import { countPending, startSyncEngine } from './lib/sync';
 import { InventoryScreen, IssuesScreen, ItemScreen, ExportScreen, RoomScreen } from './screens/Inventory';
+import { JoinScreen, pendingJoin, savePendingJoin } from './screens/Join';
+import { SignScreen } from './screens/Sign';
 import { PropertiesScreen, PropertyFormScreen, PropertyScreen, TenancyFormScreen } from './screens/Properties';
 import { SettingsScreen } from './screens/Settings';
 import { Welcome } from './screens/Welcome';
@@ -15,6 +18,9 @@ function useSession() {
   const [state, setState] = useState<{ ready: boolean; signedIn: boolean; error?: string }>({ ready: false, signedIn: false });
   useEffect(() => {
     (async () => {
+      // An invite link (#/join/<drive>/<folder>) survives the Microsoft sign-in round trip via local storage.
+      const m = /^#\/join\/([^/]+)\/([^/?]+)/.exec(window.location.hash);
+      if (m) savePendingJoin(decodeURIComponent(m[1]), decodeURIComponent(m[2]));
       await getSettings();
       let error: string | undefined;
       try {
@@ -37,6 +43,7 @@ function useSession() {
         error = e instanceof Error ? e.message : 'Sign-in failed';
       }
       const user = await currentUser();
+      if (user) await migrateLandlordInfo();
       setState({ ready: true, signedIn: !!user, error });
       if (user) startSyncEngine();
     })();
@@ -50,7 +57,9 @@ function Routes() {
   // Context for the Report issue button: wherever you are.
   let issueCtx: { inventoryId?: string; roomId?: string; itemId?: string } = {};
   let screen: ReactNode;
-  if (a === 'property' && b === 'new') screen = <PropertyFormScreen />;
+  const join = pendingJoin();
+  if (a === 'join' || join) screen = <JoinScreen />;
+  else if (a === 'property' && b === 'new') screen = <PropertyFormScreen />;
   else if (a === 'property' && b && c === 'edit') screen = <PropertyFormScreen id={b} />;
   else if (a === 'property' && b && c === 'tenancy' && d === 'new') screen = <TenancyFormScreen propertyId={b} />;
   else if (a === 'property' && b) screen = <PropertyScreen id={b} />;
@@ -64,6 +73,7 @@ function Routes() {
       issueCtx.itemId = d;
       screen = <ItemScreen key={d} id={b} itemId={d} />;
     } else if (c === 'issues') screen = <IssuesScreen id={b} />;
+    else if (c === 'sign') screen = <SignScreen id={b} />;
     else if (c === 'export') screen = <ExportScreen id={b} />;
     else screen = <InventoryScreen id={b} />;
   } else if (a === 'settings') screen = <SettingsScreen />;
@@ -95,7 +105,7 @@ export default function App() {
   }, [waiting]);
 
   if (!s.ready) return <div className="min-h-dvh flex items-center justify-center text-slate-500">Loading…</div>;
-  if (!s.signedIn) return <Welcome error={s.error} />;
+  if (!s.signedIn) return <Welcome error={s.error} invited={!!pendingJoin()} />;
   return (
     <UIProvider>
       <Routes />

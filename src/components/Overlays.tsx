@@ -4,6 +4,7 @@ import { db, getSettings, useLive } from '../lib/db';
 import * as G from '../lib/graph';
 import { inventoryDir } from '../lib/paths';
 import { processPhoto } from '../lib/photos';
+import { loadInventoryData } from '../lib/state';
 import { ISSUE_TYPES, type IssueType, type Photo } from '../lib/types';
 import { formatDateTime, inventoryTypeLabel } from '../lib/util';
 import { CameraView, type CameraRequest } from './Camera';
@@ -92,6 +93,7 @@ function IssueSheet({ ctx, onClose, onSaved }: { ctx: IssueContext; onClose: () 
   const [photoIds, setPhotoIds] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string>();
+  const locked = useLive(async () => (invId ? (await loadInventoryData(invId))?.locked : false), [invId]);
 
   const takePhoto = async (capture: boolean) => {
     if (!invId) return;
@@ -151,6 +153,11 @@ function IssueSheet({ ctx, onClose, onSaved }: { ctx: IssueContext; onClose: () 
           </select>
         )}
         {prop && <p className="font-semibold">{prop.address}</p>}
+        {locked && (
+          <p className="mt-1 rounded-lg bg-amber-50 dark:bg-amber-950 p-2" data-testid="issue-post-sign">
+            This inventory is signed and locked, so this will be saved as a dated post-sign issue.
+          </p>
+        )}
         <div className="grid grid-cols-2 gap-2 mt-2">
           <select className={inputCls} value={roomId || ''} onChange={(e) => (setRoomId(e.target.value || undefined), setItemId(undefined))} aria-label="Room">
             <option value="">Whole property</option>
@@ -218,6 +225,7 @@ function PhotoViewer({ photo, onClose }: { photo: Photo; onClose: () => void }) 
   const [url, setUrl] = useState<string>();
   const [note, setNote] = useState('');
   const author = useLive(() => db.participants.get(photo.authorId), [photo.authorId]);
+  const isLandlord = useLive(async () => ((await db.properties.get(photo.propertyId))?.role || 'landlord') === 'landlord', [photo.propertyId]);
   useEffect(() => {
     let u: string | undefined;
     let alive = true;
@@ -267,9 +275,11 @@ function PhotoViewer({ photo, onClose }: { photo: Photo; onClose: () => void }) 
         {photo.exifTakenAt && <p>Camera time: {photo.exifTakenAt.replace('T', ' ')}</p>}
         <p>OneDrive: {photo.uploadStatus === 'uploaded' ? `saved ${formatDateTime(photo.remoteCreatedAt)}` : 'waiting to upload'}</p>
         <p className="break-all text-white/70">SHA-256 {photo.sha256}</p>
-        <Button className="mt-2" onClick={useAsCover}>
-          Use as property cover photo
-        </Button>
+        {isLandlord && (
+          <Button className="mt-2" onClick={useAsCover}>
+            Use as property cover photo
+          </Button>
+        )}
       </div>
     </div>
   );

@@ -1,4 +1,4 @@
-# Inventory App: phase 1 (landlord check-in)
+# Inventory App: phases 1 and 2 (landlord check-in, tenant review and signing)
 
 > **Live app:** https://inrsiproperty.github.io/Inventory/ · repository `inrsiproperty/Inventory` · Entra app "Inventory App" in Default Directory, client ID `d2439f50-4c9e-4165-be02-46d81a73875a` (built into `src/lib/config.ts`). Setup below is already done; it's kept for reference.
 
@@ -88,6 +88,31 @@ Everything works with no signal. The cloud icon at the top of each screen shows 
 
 ---
 
+## Phase 2: tenant review and signing
+
+**Landlord**
+1. On the property page, tap **Send to tenant**. The property folder in your OneDrive is shared with each tenant's email (edit access, Microsoft sign-in required), and Microsoft emails them an invitation. The app then shows a link: send it by text or email too, because it opens the app straight on the inventory. The 7-day review window starts now.
+2. Disputes show as a red badge on the property and the inventory. Open **Issues and disputes**, reply, or change the rating. A dispute counts as answered once you reply or change the rating after it.
+3. Tap **Review and sign**, tick the box, type your name and sign with your finger. Once everyone has signed the same version, your phone locks the inventory: it becomes read-only, gets a content fingerprint and a lock date, and the signed PDF is saved to `exports/` in OneDrive.
+4. If the tenant hasn't signed when the 7 days are up, you can lock it as "issued, not signed by tenant". This is recorded on the PDF.
+5. At the end of the tenancy, tap **Remove tenant** on the property page. OneDrive stops their access straight away. They keep anything already on their phone.
+
+**Tenant**
+1. Open the link, read the privacy notice, and sign in with the invited email. A free Microsoft account is fine.
+2. Tap **Review items**. On each item, tap **Agree**, which moves you on to the next one, or **Something's not right**, which asks for a short reason and ideally a photo. You can also add photos, notes and issues.
+3. Tap **Review complete: sign**. If anything changes after you sign, you'll be asked to sign again, because a signature only counts for the exact content it signed.
+
+**Rules the app enforces**
+- Only the landlord can set ratings or change rooms and items. Only tenants can agree or dispute.
+- Nobody can delete anything. You can hide your own entry, but it stays in the history and in the PDF's appendix.
+- After locking, anything new is a dated **post-sign note** or issue, and it's kept separately from the signed content.
+
+**What OneDrive sharing allows, and how the app handles it.** OneDrive has no "add only" permission, so a tenant with edit access could change files directly in the OneDrive app. The app handles this:
+- It ignores any rating, room or item change that isn't from the landlord. It also flags entries whose OneDrive "created by" doesn't match the author they claim.
+- It ignores `property.json`, `tenancy.json` and `inventory.json` unless the landlord last saved them.
+- It re-uploads any entry file that gets deleted.
+- Photos the landlord's phone has already handed over to OneDrive can only be recovered from the landlord's OneDrive recycle bin.
+
 ## How it stores data
 
 ```
@@ -100,6 +125,7 @@ OneDrive/Property Inventories/
       inventory.json                                   rooms and items (landlord only, written with If-Match)
       entries/{timestamp}_{authorId}_{entryId}.json    one small file per change, written once, never edited
       photos/{room}/{item}/{timestamp}_{photoId}.jpg   ≤2560 px, under 2 MB, date-stamped
+      signatures/{role}_{name}_{timestamp}.png
       exports/Inventory_{address}_{type}_{date}_v{n}.pdf
 ```
 
@@ -133,6 +159,8 @@ npm run typecheck
 
 ## Tests
 
+`test/e2e2.mjs` tests phase 2 with three phones (landlord, tenant and an uninvited stranger) on a simulated OneDrive that enforces sharing permissions. It covers invite, join, simultaneous edits, disputes, forged and deleted files, signing, locking and removing access.
+
 `test/e2e.mjs` drives the app in a phone-sized Chromium (Playwright) with a fake rear camera and an in-memory OneDrive (`test/mock-graph.mjs`) that behaves like Microsoft Graph. It checks the phase 1 acceptance criteria, plus an eTag conflict and a second-phone restore. `test/check_outputs.py` checks the burned-in date stamp on every photo, and checks that the PDF is valid and renders with PDFium and Poppler.
 
 The harness was built where npm packages couldn't be downloaded. So `test/build.mjs` bundles the real source with esbuild, and swaps in small stand-ins (`test/stubs/`) for Dexie, MSAL, browser-image-compression and the PWA plugin. To run it:
@@ -144,8 +172,11 @@ node test/build.mjs && node test/e2e.mjs && python3 test/check_outputs.py
 
 (`test/build.mjs` expects esbuild, tailwindcss, react, react-dom, pdf-lib and playwright in `test/node_modules`.)
 
-## Known limits in phase 1
+## Known limits
 
 - **Sign-in each time the app is reopened.** Per the spec, tokens are kept in session storage. Closing the app forgets them, so you tap "Sign in to sync" (one tap, no password if Microsoft remembers you). Your data is always on the phone, and the app opens and works offline without signing in. Switching MSAL's `cacheLocation` to `localStorage` in `src/lib/auth.ts` would remove this prompt, but tokens would then stay on the device longer.
 - **A new phone restores entries one file at a time.** Restoring about 250 entries takes a few hundred small requests. Graph `$batch` could speed this up later.
-- Tenant invite, review, disputes, signatures and locking are phase 2. Check-out, comparison, mid-term inspections and fixed-issue status are phase 3. The "Send to tenant" button is shown but disabled.
+- **Finding a shared folder needs the link.** Microsoft has retired its "shared with me" lookup, so a tenant opens the property through the app link, which carries the folder's location. If they lose it, the landlord can tap "Show the tenant's link again".
+- **Tenants' changes arrive by folder listing.** On a folder shared from someone else's OneDrive, the app uses Graph delta where Microsoft allows it. Otherwise it lists the folder, which takes a few more requests per sync.
+- **The signed PDF is made on the landlord's phone.** If the tenant signs last, the inventory shows as signed on both phones straight away, but it's locked and the PDF saved the next time the landlord opens the app.
+- Check-out, comparison, mid-term inspections, fixed-issue status and the agent/clerk role are phase 3.

@@ -3,7 +3,7 @@ import { currentUser, db } from './db';
 import { localChange } from './events';
 import { exportFileName } from './paths';
 import { loadInventoryData, ratingSummary, type InventoryData, type ItemState } from './state';
-import type { Entry, ExportRecord, IssuePayload, Item, NotePayload, Photo } from './types';
+import type { Entry, ExportRecord, IssuePayload, Item, NotePayload, Photo, ReplyPayload, ReviewPayload, SignaturePayload } from './types';
 import { formatDate, formatDateTime, inventoryTypeLabel, nowIso, uuid } from './util';
 
 // PDF report generated on the phone with pdf-lib (spec section 8).
@@ -197,6 +197,20 @@ function issueLines(w: Writer, issues: Entry[]) {
   }
 }
 
+/** Review, dispute and reply lines for an item, oldest first. */
+function threadLines(s: ItemState | undefined): { text: string; color: ReturnType<typeof rgb> }[] {
+  if (!s) return [];
+  const out: { text: string; color: ReturnType<typeof rgb> }[] = [];
+  const thread = s.entries.filter((e) => e.type === 'agree' || e.type === 'dispute' || e.type === 'reply');
+  for (const e of thread) {
+    const who = `${e.authorName || e.authorRole}, ${formatDateTime(e.createdAt)}`;
+    if (e.type === 'agree') out.push({ text: `Tenant agreed (${who})`, color: rgb(0.08, 0.45, 0.2) });
+    else if (e.type === 'dispute') out.push({ text: `Tenant disputed (${who}): ${(e.payload as ReviewPayload).reason || ''}`, color: RED });
+    else out.push({ text: `Reply (${who}): ${(e.payload as ReplyPayload).text}`, color: INK });
+  }
+  return out;
+}
+
 async function itemBlock(w: Writer, item: Item, s: ItemState | undefined, cache: Map<string, PDFImage | null>) {
   const summary = ratingSummary(item, s);
   const photos = s?.photos || [];
@@ -209,7 +223,8 @@ async function itemBlock(w: Writer, item: Item, s: ItemState | undefined, cache:
     w.wrap(item.name, 11, w.bold, leftW).length +
     2 +
     (item.description ? w.wrap(item.description, 9, w.font, leftW).length : 0) +
-    (s ? [...s.notes, ...s.issues].reduce((n, e) => n + w.wrap(JSON.stringify(e.payload), 9, w.font, leftW - 8).length, 0) : 0);
+    (s ? [...s.notes, ...s.issues].reduce((n, e) => n + w.wrap(JSON.stringify(e.payload), 9, w.font, leftW - 8).length, 0) : 0) +
+    threadLines(s).reduce((n, l) => n + w.wrap(l.text, 9, w.font, leftW).length, 0);
   const textH = textLines * 12.5;
   const sideBySide = gridH < A4.h - 2 * M - 80;
   w.ensure(Math.max(sideBySide ? gridH : 0, Math.min(textH, 300)) + 12);
@@ -233,6 +248,7 @@ async function itemBlock(w: Writer, item: Item, s: ItemState | undefined, cache:
         maxW: leftW,
       });
     }
+    for (const l of threadLines(s)) w.text(l.text, { size: 9, color: l.color, maxW: leftW });
   }
   if (!photos.length) {
     w.y -= 4;
@@ -269,17 +285,27 @@ export async function buildPdf(data: InventoryData): Promise<Uint8Array> {
   w.text(p.postcode, { size: 15, color: MUTED, gap: 14 });
   w.rule(BLUE);
   const statusLabel =
-    inv.status === 'locked' ? 'Locked (signed)' : inv.status === 'signed' ? 'Signed' : inv.status === 'in-review' ? 'With tenant for review' : 'Draft - not yet signed';
+    inv.status === 'locked'
+      ? inv.lockReason === 'issued-not-signed-by-tenant'
+        ? 'Locked - issued, not signed by tenant'
+        : 'Locked - signed by all parties'
+      : data.allSigned
+        ? 'Signed by all parties'
+        : inv.status === 'in-review'
+          ? 'With tenant for review - not yet signed by all parties'
+          : 'Draft - not yet signed';
   w.keyValues([
     ['Property', `${p.type === 'flat' ? 'Flat' : 'House'}, ${p.bedrooms} bedroom${p.bedrooms === 1 ? '' : 's'}, ${p.furnishing === 'part' ? 'part furnished' : p.furnishing}`],
     ['Tenancy', `${formatDate(t.startDate)}${t.endDate ? ' to ' + formatDate(t.endDate) : ' (no end date set)'}`],
     ['Deposit scheme ref', t.depositRef || '-'],
-    ['Landlord', user ? `${user.name}${user.email ? ' (' + user.email + ')' : ''}` : '-'],
+    ['Landlord', p.landlordName ? `${p.landlordName}${p.landlordEmail ? ' (' + p.landlordEmail + ')' : ''}` : user ? `${user.name} (${user.email})` : '-'],
     ['Tenant(s)', t.tenants.map((x) => `${x.name}${x.email ? ' (' + x.email + ')' : ''}`).join('\n') || '-'],
     ['Inventory type', inventoryTypeLabel(inv.type)],
     ['Status', statusLabel],
     ['Version', `v${inv.version}`],
     ['Lock date', inv.lockedAt ? formatDateTime(inv.lockedAt) : 'Not locked'],
+    ['Review window', inv.reviewDeadline ? `Sent ${formatDateTime(inv.sentAt)}, review by ${formatDate(inv.reviewDeadline)}` : 'Not sent to tenant'],
+    ['Content fingerprint', `SHA-256 ${data.hash}`],
     ['Started', formatDateTime(inv.createdAt)],
     ['Report generated', formatDateTime(nowIso())],
   ]);
@@ -290,13 +316,20 @@ export async function buildPdf(data: InventoryData): Promise<Uint8Array> {
     ['Items recorded', `${data.ratedCount} of ${data.itemCount}`],
     ['Photos', String(photoCount)],
     ['Issues reported', String(data.issues.length)],
+    ['Disputes', `${data.disputes.length} (${data.openDisputes} not answered)`],
+    [
+      'Signatures',
+      data.signers.map((x) => `${x.name} (${x.role}): ${x.valid ? 'signed ' + formatDateTime((x.signature!.payload as SignaturePayload).signedAt) : x.stale ? 'signed an earlier version' : 'not signed'}`).join('\n'),
+    ],
   ]);
   w.y -= 10;
   w.text(
     'About the evidence: every entry in this report was saved with the date, time and the signed-in Microsoft account of the person who made it. ' +
       'Entries are never edited or deleted; corrections are added as new entries. Each photo shows the date and time it was taken and has a SHA-256 ' +
       'fingerprint stored with it, so any later change to the image file can be detected. Photos marked "from gallery" were chosen from the phone\'s ' +
-      'gallery rather than taken in the app. Signatures are simple electronic signatures (drawn mark, typed name, time and signed-in account).',
+      'gallery rather than taken in the app. Signatures are simple electronic signatures (drawn mark, typed name, time and signed-in account). ' +
+      'The content fingerprint is a SHA-256 hash of every signed entry; each signature records the fingerprint it signed, so a signature only counts ' +
+      'for the exact content shown. Notes added after locking are listed separately as post-sign notes.',
     { size: 8.5, color: MUTED },
   );
 
@@ -316,6 +349,26 @@ export async function buildPdf(data: InventoryData): Promise<Uint8Array> {
       await photoGrid(w, rs.photos, cache);
     }
     for (const item of items) await itemBlock(w, item, data.states.get(item.id), cache);
+  }
+
+  // ----- Post-sign notes -----
+  if (data.postSign.length) {
+    w.newPage();
+    w.band('Post-sign notes', 'added after locking; not part of the signed content');
+    for (const e of data.postSign) {
+      const room = data.rooms.find((r) => r.id === e.roomId)?.name;
+      const item = data.items.find((i) => i.id === e.itemId)?.name;
+      const where = [room, item].filter(Boolean).join(' / ') || 'General';
+      const text =
+        e.type === 'issue'
+          ? `Issue - ${(e.payload as IssuePayload).issueType}${(e.payload as IssuePayload).note ? ': ' + (e.payload as IssuePayload).note : ''}`
+          : e.type === 'reply'
+            ? `Reply: ${(e.payload as ReplyPayload).text}`
+            : (e.payload as NotePayload).text;
+      w.text(`${formatDateTime(e.createdAt)} - ${e.authorName || e.authorRole} (${e.authorRole}) - ${where}: ${text}`, { size: 9 });
+    }
+    const psPhotos = data.photos.filter((ph) => data.entries.find((x) => x.id === ph.entryId)?.postSign);
+    if (psPhotos.length) await photoGrid(w, psPhotos, cache);
   }
 
   // ----- Appendix -----
@@ -338,8 +391,53 @@ export async function buildPdf(data: InventoryData): Promise<Uint8Array> {
     });
   }
   w.band('Signatures');
-  const sigs = data.entries.filter((e) => e.type === 'signature');
-  if (!sigs.length) w.text('Not yet signed by any party. This report is a draft.', { size: 9, color: MUTED });
+  const signed = data.signers.filter((x) => x.signature);
+  if (!signed.length) w.text('Not yet signed by any party. This report is a draft.', { size: 9, color: MUTED });
+  if (inv.lockReason === 'issued-not-signed-by-tenant')
+    w.text(`Locked by the landlord on ${formatDateTime(inv.lockedAt)} after the 7-day review window ended: issued, not signed by tenant.`, { size: 9.5, bold: true, color: RED });
+  for (const x of data.signers) {
+    const sp = x.signature?.payload as SignaturePayload | undefined;
+    w.ensure(110);
+    w.rule();
+    w.text(`${x.name} - ${x.role}${x.email ? ' - ' + x.email : ''}`, { size: 10.5, bold: true });
+    if (!sp) {
+      w.text('Not signed.', { size: 9, color: MUTED });
+      continue;
+    }
+    w.text(
+      `Typed name: ${sp.typedName}. Signed ${formatDateTime(sp.signedAt)} with Microsoft account ${sp.email}. Confirmed they reviewed the inventory. ` +
+        `Signed fingerprint ${sp.contentHash.slice(0, 16)}... ${x.valid ? '(matches this content)' : '(an earlier version: content changed after signing)'}`,
+      { size: 8.5, color: x.valid ? INK : RED },
+    );
+    const img = await signatureImage(doc, sp.fileId);
+    if (img) {
+      const h = 60;
+      const iw = Math.min(220, (img.width / img.height) * h);
+      w.ensure(h + 6);
+      w.page.drawImage(img, { x: M, y: w.y - h, width: iw, height: h });
+      w.page.drawRectangle({ x: M, y: w.y - h, width: iw, height: h, borderColor: RULE, borderWidth: 0.6 });
+      w.y -= h + 6;
+    } else w.text('(Signature image not on this phone yet; it is stored in OneDrive.)', { size: 8, color: MUTED });
+  }
+  w.text('These are simple electronic signatures: a drawn mark, typed name, time and the signed-in Microsoft account.', { size: 8, color: MUTED, gap: 4 });
+
+  if (data.hidden.length) {
+    w.band('Hidden entries', 'hidden by their author; kept as evidence');
+    for (const e of data.hidden) {
+      const item = data.items.find((i) => i.id === e.itemId)?.name || 'General';
+      const text =
+        e.type === 'note'
+          ? (e.payload as NotePayload).text
+          : e.type === 'reply'
+            ? (e.payload as ReplyPayload).text
+            : e.type === 'dispute'
+              ? 'Dispute: ' + ((e.payload as ReviewPayload).reason || '')
+              : e.type === 'issue'
+                ? 'Issue: ' + (e.payload as IssuePayload).issueType
+                : e.type;
+      w.text(`${formatDateTime(e.createdAt)} - ${e.authorName || e.authorRole} - ${item}: ${text}`, { size: 8.5, color: MUTED });
+    }
+  }
 
   // Footer on every page.
   const pages = doc.getPages();
@@ -350,6 +448,16 @@ export async function buildPdf(data: InventoryData): Promise<Uint8Array> {
     pg.drawText(right, { x: A4.w - M - font.widthOfTextAtSize(right, 7.5), y: 22, size: 7.5, font, color: MUTED });
   });
   return doc.save();
+}
+
+async function signatureImage(doc: PDFDocument, fileId: string): Promise<PDFImage | null> {
+  const rec = await db.blobs.get(`${fileId}:file`);
+  if (!rec) return null;
+  try {
+    return await doc.embedPng(new Uint8Array(await rec.blob.arrayBuffer()));
+  } catch {
+    return null;
+  }
 }
 
 function isSpecial(key: string) {

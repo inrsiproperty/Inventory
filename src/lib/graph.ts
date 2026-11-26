@@ -17,7 +17,18 @@ export interface DriveItem {
   folder?: { childCount?: number };
   deleted?: { state?: string };
   parentReference?: { driveId?: string; id?: string; path?: string };
+  createdBy?: { user?: { id?: string; email?: string; displayName?: string } };
+  lastModifiedBy?: { user?: { id?: string; email?: string; displayName?: string } };
   '@microsoft.graph.downloadUrl'?: string;
+}
+
+export interface Permission {
+  id: string;
+  roles?: string[];
+  grantedToV2?: { user?: { id?: string; email?: string; displayName?: string } };
+  grantedToIdentitiesV2?: { user?: { id?: string; email?: string; displayName?: string } }[];
+  invitation?: { email?: string };
+  link?: { webUrl?: string };
 }
 
 /** Where to write: either a path from the drive root of /me/drive, or a folder item in any drive. */
@@ -212,4 +223,54 @@ export async function downloadByPath(target: DriveTarget, relPath: string): Prom
   const url = meta?.['@microsoft.graph.downloadUrl'];
   if (!url) return null;
   return call(url, {}, false).then((r) => r.blob());
+}
+
+export async function getItemById(driveId: string, itemId: string): Promise<DriveItem> {
+  return call(`/drives/${driveId}/items/${itemId}`).then((r) => r.json());
+}
+
+export async function listChildrenById(driveId: string, itemId: string): Promise<DriveItem[]> {
+  const out: DriveItem[] = [];
+  let next: string | undefined = `/drives/${driveId}/items/${itemId}/children?$top=200`;
+  while (next) {
+    const j: { value: DriveItem[]; '@odata.nextLink'?: string } = await call(next).then((r) => r.json());
+    out.push(...j.value);
+    next = j['@odata.nextLink'];
+  }
+  return out;
+}
+
+/** Share a folder with people by email (write access, sign-in required). Returns the new permissions. */
+export async function invite(driveId: string, itemId: string, emails: string[], message: string): Promise<Permission[]> {
+  const r = await call(`/drives/${driveId}/items/${itemId}/invite`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      recipients: emails.map((email) => ({ email })),
+      message: message.slice(0, 2000),
+      requireSignIn: true,
+      sendInvitation: true,
+      roles: ['write'],
+    }),
+  });
+  return (await r.json()).value || [];
+}
+
+export async function listPermissions(driveId: string, itemId: string): Promise<Permission[]> {
+  const r = await call(`/drives/${driveId}/items/${itemId}/permissions`);
+  return (await r.json()).value || [];
+}
+
+export async function deletePermission(driveId: string, itemId: string, permissionId: string): Promise<void> {
+  try {
+    await call(`/drives/${driveId}/items/${itemId}/permissions/${permissionId}`, { method: 'DELETE' });
+  } catch (e) {
+    if (e instanceof GraphError && e.status === 404) return; // already gone
+    throw e;
+  }
+}
+
+export function permissionEmails(p: Permission): string[] {
+  const out = [p.grantedToV2?.user?.email, p.invitation?.email, ...(p.grantedToIdentitiesV2 || []).map((g) => g.user?.email)];
+  return out.filter((x): x is string => !!x).map((x) => x.toLowerCase());
 }

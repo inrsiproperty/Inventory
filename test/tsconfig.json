@@ -5,7 +5,7 @@
     "baseUrl": "..", "ignoreDeprecations": "6.0",
     "paths": {
       "dexie": ["test/stubs/dexie.ts"], "@azure/msal-browser": ["test/stubs/msal.ts"],
-      "browser-image-compression": ["test/stubs/image-compression.ts"], "virtual:pwa-register": ["test/stubs/pwa-register.ts"],
+      "browser-image-compression": ["test/stubs/image-compression.ts"], "virtual:pwa-register": ["test/stubs/pwa-register.ts"], "signature_pad": ["test/stubs/signature-pad.ts"],
       "pdf-lib": ["test/node_modules/pdf-lib"]
     }
   },

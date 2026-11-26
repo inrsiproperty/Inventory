@@ -143,10 +143,10 @@ export default class Dexie {
   private _version = 1;
   constructor(public name: string) {}
   version(n: number) {
-    this._version = n;
+    this._version = Math.max(this._version, n);
     return {
       stores: (schema: Record<string, string>) => {
-        this._schema = schema;
+        this._schema = { ...this._schema, ...schema };
         for (const [t, spec] of Object.entries(schema)) {
           const keyPath = spec.split(',')[0].trim();
           (this as unknown as Record<string, unknown>)[t] = new Table(this, t, keyPath);

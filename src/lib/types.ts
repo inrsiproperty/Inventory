@@ -31,7 +31,8 @@ export type EntryType =
   | 'reply'
   | 'fixed'
   | 'signature'
-  | 'structure-change';
+  | 'structure-change'
+  | 'hide';
 
 export const CONDITIONS: Condition[] = ['New', 'Good', 'Fair', 'Poor', 'Damaged', 'Missing'];
 export const CLEANLINESS: Cleanliness[] = ['Professionally clean', 'Clean', 'Needs cleaning'];
@@ -63,7 +64,13 @@ export interface Property {
   furnishing: Furnishing;
   coverPhotoId?: string;
   createdAt: string;
+  landlordId?: string; // Graph /me id of the landlord who owns the folder
+  landlordName?: string;
+  landlordEmail?: string;
   // local
+  role?: Role; // this user's role for this property (default landlord)
+  accessRevoked?: boolean; // tenant: the landlord removed access
+  landlordDriveUserId?: string; // OneDrive "createdBy" id of the landlord, to verify authorship
   folderName: string; // {address-slug}_{propertyId}
   driveId?: string;
   folderId?: string;
@@ -76,6 +83,9 @@ export interface TenantRef {
   name: string;
   email: string;
   msAccountId?: string;
+  invitedAt?: string;
+  permissionIds?: string[];
+  removedAt?: string;
 }
 
 export interface Tenancy {
@@ -101,6 +111,9 @@ export interface Inventory {
   version: number;
   lockedAt?: string;
   reviewDeadline?: string;
+  sentAt?: string;
+  lockReason?: 'all-signed' | 'issued-not-signed-by-tenant';
+  contentHash?: string; // SHA-256 of the signed content, printed on the PDF
   createdAt: string;
   folderName: string; // {type}_{date}_{inventoryId}
   dirty: 0 | 1;
@@ -140,6 +153,9 @@ export interface Entry {
   createdAt: string; // device time, ISO
   type: EntryType;
   payload: EntryPayload;
+  postSign?: boolean; // added after the inventory was locked; shown separately
+  // local
+  authorVerified?: boolean; // false if OneDrive says someone else created the file
   dirty: 0 | 1;
   sync?: SyncMeta;
 }
@@ -165,6 +181,30 @@ export interface IssuePayload {
   photoIds: string[];
   status: IssueStatus;
 }
+export interface ReviewPayload {
+  reason?: string; // dispute only
+  photoIds?: string[];
+}
+export interface ReplyPayload {
+  text: string;
+  replyTo?: string; // entry id
+}
+export interface HidePayload {
+  entryId: string;
+}
+export interface SignaturePayload {
+  signerId: string;
+  role: Role;
+  typedName: string;
+  email: string;
+  imageFile: string; // relative to the inventory folder
+  fileId: string;
+  signedAt: string;
+  inventoryVersion: number;
+  contentHash: string;
+  reviewed: boolean;
+}
+
 export type StructureOp =
   | { op: 'create-from-template'; rooms: Room[]; items: Item[] }
   | { op: 'add-room'; room: Room }
@@ -180,6 +220,10 @@ export type StructureOp =
 
 export type EntryPayload =
   | RatingPayload
+  | ReviewPayload
+  | ReplyPayload
+  | HidePayload
+  | SignaturePayload
   | NotePayload
   | PhotoPayload
   | IssuePayload
@@ -217,6 +261,19 @@ export interface Photo extends PhotoMeta {
 export interface BlobRecord {
   key: string; // `${id}:full` | `${id}:thumb` | `${exportId}:pdf`
   blob: Blob;
+}
+
+/** Non-photo files that belong to entries (signature images). */
+export interface FileRecord {
+  id: string;
+  entryId: string;
+  inventoryId: string;
+  propertyId: string;
+  relPath: string; // relative to the inventory folder
+  contentType: string;
+  uploadStatus: UploadStatus;
+  hasBlob: 0 | 1;
+  sync?: SyncMeta;
 }
 
 export interface Participant {

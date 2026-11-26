@@ -1,8 +1,8 @@
 {
   "name": "inventory-app",
   "private": true,
-  "version": "0.1.0",
-  "description": "Inventory App - phone-first property inventories stored in the landlord's OneDrive (phase 1: landlord check-in).",
+  "version": "0.2.0",
+  "description": "Inventory App - phone-first property inventories stored in the landlord's OneDrive (phase 2: tenant review, disputes and signing).",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -16,7 +16,8 @@
     "dexie": "^4.0.10",
     "pdf-lib": "^1.17.1",
     "react": "^19.1.0",
-    "react-dom": "^19.1.0"
+    "react-dom": "^19.1.0",
+    "signature_pad": "^5.0.4"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.1.8",

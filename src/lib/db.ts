@@ -5,6 +5,7 @@ import type {
   BlobRecord,
   Entry,
   ExportRecord,
+  FileRecord,
   Inventory,
   Item,
   KV,
@@ -33,6 +34,7 @@ export class InventoryDB extends Dexie {
   settings!: Table<AppSettings, string>;
   kv!: Table<KV, string>;
   remoteFiles!: Table<RemoteFile, string>;
+  files!: Table<FileRecord, string>;
 
   constructor() {
     super('inventory-app');
@@ -50,6 +52,10 @@ export class InventoryDB extends Dexie {
       settings: 'key, dirty',
       kv: 'key',
       remoteFiles: 'id, propertyId',
+    });
+    // Phase 2: signature images and other entry attachments.
+    this.version(2).stores({
+      files: 'id, uploadStatus, inventoryId, entryId',
     });
   }
 }
@@ -107,7 +113,20 @@ export function useLive<T>(query: () => Promise<T> | T, deps: unknown[] = [], in
 
 /** Strip local-only fields before writing a record to OneDrive. */
 export function forRemote<T extends object>(rec: T, extra: string[] = []): Partial<T> {
-  const drop = new Set(['dirty', 'sync', 'deltaLink', 'driveId', 'folderId', 'hasFull', 'hasThumb', ...extra]);
+  const drop = new Set([
+    'dirty',
+    'sync',
+    'deltaLink',
+    'driveId',
+    'folderId',
+    'hasFull',
+    'hasThumb',
+    'role',
+    'accessRevoked',
+    'landlordDriveUserId',
+    'authorVerified',
+    ...extra,
+  ]);
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(rec)) if (!drop.has(k)) out[k] = v;
   return out as Partial<T>;

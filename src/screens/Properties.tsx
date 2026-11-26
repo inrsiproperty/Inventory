@@ -1,12 +1,32 @@
 import { useState } from 'react';
 import { SyncBadge } from '../components/SyncBadge';
 import { Button, Card, Chip, Empty, Field, Header, Icon, Screen, SectionTitle, Sheet, Thumb, inputCls } from '../components/ui';
-import { createProperty, createTenancy, startInventory, updateProperty, updateTenancy, type PropertyInput } from '../lib/actions';
+import { useUI } from '../components/Overlays';
+import {
+  createProperty,
+  createTenancy,
+  joinLink,
+  removeTenantAccess,
+  sendToTenant,
+  startInventory,
+  updateProperty,
+  updateTenancy,
+  type PropertyInput,
+} from '../lib/actions';
+import { loadInventoryData } from '../lib/state';
 import { db, readSettings, useLive } from '../lib/db';
 import { go } from '../lib/router';
 import { defaultRoomChoices, type RoomChoice } from '../lib/templates';
-import type { Furnishing, PropertyType, TenantRef } from '../lib/types';
-import { formatDate, inventoryTypeLabel, plural } from '../lib/util';
+import type { Furnishing, Inventory, PropertyType, TenantRef } from '../lib/types';
+import { formatDate, formatDateTime, inventoryTypeLabel, plural } from '../lib/util';
+
+export function statusLabel(inv: Inventory, locked?: boolean): string {
+  if (inv.status === 'locked' || locked)
+    return inv.lockReason === 'issued-not-signed-by-tenant' ? 'locked, issued (not signed by tenant)' : 'signed and locked';
+  if (inv.status === 'in-review') return 'with tenant to review';
+  if (inv.status === 'signed') return 'signed';
+  return 'in progress';
+}
 
 // ---------- Properties list ----------
 
@@ -21,6 +41,16 @@ export function PropertiesScreen() {
       return { p, t, inv };
     });
   }, []);
+  // Disputes waiting for the landlord, per property.
+  const badges = useLive(async () => {
+    const out: Record<string, { open: number; locked: boolean }> = {};
+    for (const inv of await db.inventories.toArray()) {
+      const d = await loadInventoryData(inv.id);
+      if (d) out[inv.id] = { open: d.role === 'landlord' ? d.openDisputes : 0, locked: d.locked };
+    }
+    return out;
+  }, []);
+  const tenantOnly = !!data?.length && data.every((x) => x.p.role === 'tenant');
   return (
     <>
       <Header
@@ -33,9 +63,11 @@ export function PropertiesScreen() {
       />
       <Screen
         bottom={
-          <Button kind="primary" className="flex-1 text-lg" onClick={() => go('/property/new')} data-testid="add-property">
-            <Icon name="plus" /> Add property
-          </Button>
+          tenantOnly ? undefined : (
+            <Button kind="primary" className="flex-1 text-lg" onClick={() => go('/property/new')} data-testid="add-property">
+              <Icon name="plus" /> Add property
+            </Button>
+          )
         }
       >
         <SyncBadge />
@@ -56,15 +88,29 @@ export function PropertiesScreen() {
                 <p className="text-sm mt-1">
                   {t ? `${t.tenants.map((x) => x.name).join(', ') || 'Tenancy'} · from ${formatDate(t.startDate)}` : 'No tenancy yet'}
                 </p>
+                {p.role === 'tenant' && (
+                  <p className="text-sm text-slate-600 dark:text-slate-400">You're the tenant{p.landlordName ? ` · landlord ${p.landlordName}` : ''}</p>
+                )}
+                {p.accessRevoked && <p className="text-sm font-semibold text-amber-800 dark:text-amber-200">Access ended by the landlord</p>}
                 {inv && (
                   <p className="text-sm font-semibold text-blue-800 dark:text-blue-300">
-                    {inventoryTypeLabel(inv.type)}: {inv.status === 'draft' ? 'in progress' : inv.status}
+                    {inventoryTypeLabel(inv.type)}: {statusLabel(inv, badges?.[inv.id]?.locked)}
+                  </p>
+                )}
+                {inv && !!badges?.[inv.id]?.open && (
+                  <p className="text-sm font-semibold text-red-700 dark:text-red-300" data-testid="dispute-badge">
+                    ⚠ {plural(badges[inv.id].open, 'dispute')} to answer
                   </p>
                 )}
               </div>
             </Card>
           ))}
         </div>
+        {tenantOnly && (
+          <Button kind="ghost" className="mt-4" onClick={() => go('/property/new')} data-testid="add-property">
+            I'm a landlord: add a property of my own
+          </Button>
+        )}
       </Screen>
     </>
   );
@@ -154,12 +200,45 @@ export function PropertyScreen({ id }: { id: string }) {
     const p = await db.properties.get(id);
     const tenancies = (await db.tenancies.where('propertyId').equals(id).toArray()).sort((a, b) => b.startDate.localeCompare(a.startDate));
     const invs = await db.inventories.where('propertyId').equals(id).toArray();
-    return { p, tenancies, invs };
+    const lockedIds = new Set<string>();
+    for (const inv of invs) if ((await loadInventoryData(inv.id))?.locked) lockedIds.add(inv.id);
+    return { p, tenancies, invs, lockedIds };
   }, [id]);
+  const { toast } = useUI();
   const [startFor, setStartFor] = useState<string | null>(null);
+  const [shareLink, setShareLink] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [err, setErr] = useState<string>();
   if (!data) return null;
-  const { p, tenancies, invs } = data;
+  const { p, tenancies, invs, lockedIds } = data;
   if (!p) return <Header title="Property not found" back="/" />;
+  const landlord = (p.role || 'landlord') === 'landlord';
+
+  const send = async (tenancyId: string, inventoryId: string) => {
+    setBusy('send:' + tenancyId);
+    setErr(undefined);
+    try {
+      setShareLink(await sendToTenant(tenancyId, inventoryId));
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'Could not send');
+    } finally {
+      setBusy(null);
+    }
+  };
+  const remove = async (tenancyId: string, t: TenantRef) => {
+    if (!window.confirm(`Remove ${t.name || t.email}'s access to this property's OneDrive folder? They keep any PDFs they already have.`)) return;
+    setBusy('remove:' + t.email);
+    setErr(undefined);
+    try {
+      await removeTenantAccess(tenancyId, t.email);
+      toast(`${t.name || t.email} no longer has access`);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'Could not remove access');
+    } finally {
+      setBusy(null);
+    }
+  };
+
   return (
     <>
       <Header
@@ -167,27 +246,45 @@ export function PropertyScreen({ id }: { id: string }) {
         sub={p.postcode}
         back="/"
         right={
-          <button className="tap rounded-full p-2" aria-label="Edit property" onClick={() => go(`/property/${id}/edit`)}>
-            <Icon name="edit" />
-          </button>
+          landlord ? (
+            <button className="tap rounded-full p-2" aria-label="Edit property" onClick={() => go(`/property/${id}/edit`)}>
+              <Icon name="edit" />
+            </button>
+          ) : undefined
         }
       />
       <Screen
         bottom={
-          <Button kind="primary" className="flex-1 text-lg" onClick={() => go(`/property/${id}/tenancy/new`)} data-testid="new-tenancy">
-            <Icon name="plus" /> New tenancy
-          </Button>
+          landlord ? (
+            <Button kind="primary" className="flex-1 text-lg" onClick={() => go(`/property/${id}/tenancy/new`)} data-testid="new-tenancy">
+              <Icon name="plus" /> New tenancy
+            </Button>
+          ) : undefined
         }
       >
+        {p.accessRevoked && (
+          <Card className="mb-3 !border-amber-400 bg-amber-50 dark:bg-amber-950" >
+            <p className="font-semibold" data-testid="access-ended">Your access to this property has ended.</p>
+            <p className="text-sm">The landlord removed you from the shared folder. What's already on this phone, including any PDFs, stays here.</p>
+          </Card>
+        )}
         {p.coverPhotoId && <Thumb photoId={p.coverPhotoId} className="w-full h-44 rounded-2xl mb-3" alt="Cover photo" />}
         <Card>
           <p>
             {p.type === 'flat' ? 'Flat' : 'House'} · {plural(p.bedrooms, 'bedroom')} · {p.furnishing === 'part' ? 'part furnished' : p.furnishing}
           </p>
-          <p className="text-sm text-slate-600 dark:text-slate-400 mt-1">OneDrive folder: Property Inventories/{p.folderName}</p>
+          {landlord ? (
+            <p className="text-sm text-slate-600 dark:text-slate-400 mt-1">OneDrive folder: Property Inventories/{p.folderName}</p>
+          ) : (
+            <p className="text-sm text-slate-600 dark:text-slate-400 mt-1">
+              Shared with you by {p.landlordName || 'your landlord'}
+              {p.landlordEmail ? ` (${p.landlordEmail})` : ''}
+            </p>
+          )}
         </Card>
+        {err && <p className="text-red-700 dark:text-red-300 mt-3" data-testid="property-error">{err}</p>}
         <SectionTitle>Tenancies</SectionTitle>
-        {!tenancies.length && <Empty>Add a tenancy (tenant names, emails and start date) to start the check-in.</Empty>}
+        {!tenancies.length && <Empty>{landlord ? 'Add a tenancy (tenant names, emails and start date) to start the check-in.' : 'Loading from OneDrive…'}</Empty>}
         <div className="space-y-3">
           {tenancies.map((t) => {
             const ti = invs.filter((i) => i.tenancyId === t.id).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
@@ -202,33 +299,108 @@ export function PropertyScreen({ id }: { id: string }) {
                       {t.depositRef ? ` · deposit ref ${t.depositRef}` : ''}
                     </p>
                   </div>
-                  <button className="tap rounded-full p-2 shrink-0" aria-label="Edit tenancy" onClick={() => go(`/tenancy/${t.id}/edit`)}>
-                    <Icon name="edit" className="w-5 h-5" />
-                  </button>
+                  {landlord && (
+                    <button className="tap rounded-full p-2 shrink-0" aria-label="Edit tenancy" onClick={() => go(`/tenancy/${t.id}/edit`)}>
+                      <Icon name="edit" className="w-5 h-5" />
+                    </button>
+                  )}
                 </div>
                 <div className="mt-3 space-y-2">
                   {ti.map((inv) => (
-                    <Button key={inv.id} className="w-full justify-between" onClick={() => go(`/inventory/${inv.id}`)}>
+                    <Button key={inv.id} className="w-full justify-between" onClick={() => go(`/inventory/${inv.id}`)} data-testid="open-inventory">
                       <span>{inventoryTypeLabel(inv.type)}</span>
-                      <span className="text-sm font-normal">{inv.status === 'draft' ? 'In progress' : inv.status} ›</span>
+                      <span className="text-sm font-normal">{statusLabel(inv, lockedIds.has(inv.id))} ›</span>
                     </Button>
                   ))}
-                  {!checkIn && (
+                  {landlord && !checkIn && (
                     <Button kind="primary" className="w-full" onClick={() => setStartFor(t.id)} data-testid="start-check-in">
                       Start check-in
                     </Button>
                   )}
-                  <Button kind="ghost" className="w-full" disabled title="Arrives in phase 2">
-                    Send to tenant (coming in phase 2)
-                  </Button>
+                  {landlord && checkIn && !lockedIds.has(checkIn.id) && (
+                    <Button
+                      kind={checkIn.status === 'draft' ? 'primary' : 'secondary'}
+                      className="w-full"
+                      disabled={busy === 'send:' + t.id}
+                      onClick={() => send(t.id, checkIn.id)}
+                      data-testid="send-to-tenant"
+                    >
+                      <Icon name="share" /> {busy === 'send:' + t.id ? 'Sharing…' : checkIn.status === 'draft' ? 'Send to tenant' : 'Send again'}
+                    </Button>
+                  )}
                 </div>
+                {landlord && t.tenants.some((x) => x.invitedAt) && (
+                  <div className="mt-4 border-t border-slate-200 dark:border-slate-800 pt-3 space-y-2">
+                    <p className="text-sm font-semibold text-slate-600 dark:text-slate-400">Tenant access</p>
+                    {t.tenants.map((x) => (
+                      <div key={x.email} className="flex items-center gap-2 justify-between">
+                        <div className="min-w-0">
+                          <p className="truncate">{x.name || x.email}</p>
+                          <p className="text-xs text-slate-600 dark:text-slate-400">
+                            {x.removedAt ? `Access removed ${formatDateTime(x.removedAt)}` : x.invitedAt ? `Invited ${formatDateTime(x.invitedAt)}` : 'Not invited yet'}
+                          </p>
+                        </div>
+                        {x.invitedAt && !x.removedAt && (
+                          <Button kind="danger" disabled={busy === 'remove:' + x.email} onClick={() => remove(t.id, x)} data-testid="remove-tenant">
+                            Remove tenant
+                          </Button>
+                        )}
+                      </div>
+                    ))}
+                    {p.driveId && (
+                      <Button kind="ghost" onClick={() => setShareLink(joinLink(p))}>
+                        Show the tenant's link again
+                      </Button>
+                    )}
+                  </div>
+                )}
               </Card>
             );
           })}
         </div>
       </Screen>
       {startFor && <StartCheckInSheet tenancyId={startFor} bedrooms={p.bedrooms} onClose={() => setStartFor(null)} />}
+      {shareLink && <ShareLinkSheet link={shareLink} address={p.address} onClose={() => setShareLink(null)} />}
     </>
+  );
+}
+
+function ShareLinkSheet({ link, address, onClose }: { link: string; address: string; onClose: () => void }) {
+  const [copied, setCopied] = useState(false);
+  const text = `Here's the check-in inventory for ${address}. Please open this link on your phone, sign in with your Microsoft account (the email I invited), check each item, then sign: ${link}`;
+  return (
+    <Sheet open onClose={onClose} title="Sent to your tenant">
+      <p className="mb-3">
+        Microsoft has emailed them an invitation to the property's OneDrive folder. Also send them this link by text or email; it opens the app straight
+        on the inventory. They have 7 days to review and sign.
+      </p>
+      <p className="rounded-xl bg-slate-100 dark:bg-slate-800 p-3 text-sm break-all mb-3" data-testid="join-link">
+        {link}
+      </p>
+      <div className="flex gap-2">
+        <Button
+          kind="primary"
+          className="flex-1"
+          onClick={async () => {
+            if (navigator.share) await navigator.share({ title: 'Property inventory', text, url: link }).catch(() => undefined);
+            else {
+              await navigator.clipboard?.writeText(text).catch(() => undefined);
+              setCopied(true);
+            }
+          }}
+        >
+          <Icon name="share" /> Share link
+        </Button>
+        <Button
+          onClick={async () => {
+            await navigator.clipboard?.writeText(link).catch(() => undefined);
+            setCopied(true);
+          }}
+        >
+          {copied ? 'Copied' : 'Copy'}
+        </Button>
+      </div>
+    </Sheet>
   );
 }
 

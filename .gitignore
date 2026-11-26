@@ -5,3 +5,4 @@ test-results/
 test/fixtures/
 test/node_modules
 .env.local
+test-results-2/
