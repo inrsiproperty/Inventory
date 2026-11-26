@@ -1,5 +1,7 @@
 # Inventory App: phase 1 (landlord check-in)
 
+> **Live app:** https://inrsiproperty.github.io/Inventory/ · repository `inrsiproperty/Inventory` · Entra app "Inventory App" in Default Directory, client ID `d2439f50-4c9e-4165-be02-46d81a73875a` (built into `src/lib/config.ts`). Setup below is already done; it's kept for reference.
+
 Inventory App is a phone-first web app (PWA) for photo-evidenced property inventories. Everything is saved on the phone first, then synced to the landlord's own OneDrive. There's no app server.
 
 Phase 1 covers sign-in, properties, tenancies, rooms and items from UK templates, walk-through photo capture, condition ratings, Report issue, meters, keys, safety checks and documents, offline save with OneDrive sync, and PDF export.
