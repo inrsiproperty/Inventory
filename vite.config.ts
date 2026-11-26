@@ -33,6 +33,10 @@ export default defineConfig({
         ],
       },
       workbox: {
+        // New versions take over straight away instead of waiting for every tab to close.
+        skipWaiting: true,
+        clientsClaim: true,
+        cleanupOutdatedCaches: true,
         // Cache the whole app shell so it opens with no signal.
         globPatterns: ['**/*.{js,css,html,svg,png,ico,webmanifest}'],
         navigateFallback: 'index.html',
